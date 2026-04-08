@@ -1496,6 +1496,27 @@ def resolve_vision_provider_client(
             ordered.remove(preferred)
             ordered.insert(0, preferred)
 
+        # ── Non-aggregator main provider: try first ──────────────────────
+        # Users on Alibaba, DeepSeek, ZAI, Gemini, named custom providers,
+        # etc. may not have OpenRouter/Nous keys. Their main provider isn't
+        # in _VISION_AUTO_PROVIDER_ORDER so the loop below would skip it.
+        # If the model doesn't actually support vision, call_llm handles
+        # the API-level fallback (see _vision_call_with_fallback).
+        main_provider = _read_main_provider()
+        main_model = _read_main_model()
+        if (main_provider
+                and main_model
+                and main_provider not in _AGGREGATOR_PROVIDERS
+                and main_provider not in _VISION_AUTO_PROVIDER_ORDER
+                and main_provider not in ("auto", "")):
+            sync_client, resolved_model = resolve_provider_client(main_provider, main_model)
+            if sync_client is not None:
+                logger.info(
+                    "Vision auto-detect: trying main provider %s (%s) first",
+                    main_provider, resolved_model or main_model,
+                )
+                return _finalize(main_provider, sync_client, resolved_model or main_model)
+
         for candidate in ordered:
             sync_client, default_model = _resolve_strict_vision_backend(candidate)
             if sync_client is not None:
@@ -2008,6 +2029,36 @@ def call_llm(
                 if not _is_payment_error(retry_err):
                     raise
                 first_err = retry_err
+
+        # ── Vision model capability fallback ─────────────────────────
+        # When vision auto-detection picks the main provider but the model
+        # doesn't support images (400/422), fall back to the strict vision
+        # backends (OpenRouter, Nous, Codex, Anthropic) which use known
+        # vision-capable models.  Only fires in auto mode — if the user
+        # explicitly chose a provider, respect their choice and let it fail.
+        if (task == "vision"
+                and not _is_payment_error(first_err)
+                and resolved_provider not in _VISION_AUTO_PROVIDER_ORDER
+                and not resolved_base_url):
+            status = getattr(first_err, "status_code", None)
+            if status in (400, 422) or status is None:
+                logger.warning(
+                    "Vision call failed with %s (%s), trying fallback vision backends",
+                    resolved_provider, first_err,
+                )
+                for candidate in _VISION_AUTO_PROVIDER_ORDER:
+                    fb_sync, fb_default = _resolve_strict_vision_backend(candidate)
+                    if fb_sync is not None:
+                        fb_model_final = fb_default
+                        fb_kwargs = _build_call_kwargs(
+                            candidate, fb_model_final, messages,
+                            temperature=temperature, max_tokens=max_tokens,
+                            tools=tools, timeout=effective_timeout,
+                            extra_body=extra_body)
+                        try:
+                            return fb_sync.chat.completions.create(**fb_kwargs)
+                        except Exception:
+                            continue  # Try next backend
 
         # ── Payment / credit exhaustion fallback ──────────────────────
         # When the resolved provider returns 402 or a credit-related error,
